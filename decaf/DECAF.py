@@ -1,11 +1,12 @@
 from collections import OrderedDict
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, Tuple
 
 import networkx as nx
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import decaf.logger as log
 
@@ -51,15 +52,70 @@ class TraceExpm(torch.autograd.Function):
 trace_expm = TraceExpm.apply
 
 
+class EmbeddingBlock(nn.Module):
+    def __init__(self, h_dim_per_feature, feature_types: Optional[List[int]], msk: Optional[torch.Tensor]=None):
+        super(EmbeddingBlock, self).__init__()
+        # noise is a feature
+        ft = feature_types + [-1]
+        if msk is None:
+            msk = [1] * len(ft)
+        else:
+            msk = torch.cat((msk, torch.tensor([1.], device=DEVICE)), dim=0)
+        self.msk = msk
+        self.ft = ft
+        self.h_dim = h_dim_per_feature
+        self.encoders = nn.ModuleList([
+            nn.Sequential(
+                # nn.Linear(1 if t == -1 else t, 32), nn.ReLU(inplace=True),
+                nn.Linear(1, 32), nn.ReLU(inplace=True),
+                nn.Linear(32, 16), nn.ReLU(inplace=True)
+            ) if msk[i] else None for i, t in enumerate(ft)])
+        self.fc = nn.Sequential(
+            nn.Linear(16 * len(feature_types), h_dim_per_feature * len(feature_types)),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor, msk=None, biased_edges=None):
+        # mask
+        if msk is not None:
+            assert (self.msk[:-1] != msk).sum() == 0
+            x = x * msk
+        # add noise input
+        x = torch.cat([x, z], dim=1)
+        # debiasing
+        if biased_edges is not None:
+            for j in biased_edges:
+                x_j = x[:, j]
+                perm = torch.randperm(len(x_j))
+                x[:, j] = x_j[perm]
+        # embed
+        # out = B x Num_features x Hidden_dims_per_feature -> B x Hidden_dims
+        out = torch.zeros((x.size(0), len(self.ft), self.h_dim), device=DEVICE)
+        for i in range(len(self.ft)):
+            # if the i-th entry of the mask is 1
+            if i == len(self.ft) - 1 or msk[i] == 1:
+                # if self.ft[i] > 1:
+                #     xx = F.one_hot(x[:, i].round().long(), num_classes=self.ft[i]).float().to(DEVICE)
+                # else:
+                #     xx = x[:, i].unsqueeze(1)
+                xx = x[:, i].unsqueeze(1)
+                out[:, i, :] = self.encoders[i](xx)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
+
 class Generator_causal(nn.Module):
     def __init__(
-        self,
-        z_dim: int,
-        x_dim: int,
-        h_dim: int,
-        f_scale: float = 0.1,
-        dag_seed: list = [],
-        nonlin_out: Optional[List] = None,
+            self,
+            z_dim: int,
+            x_dim: int,
+            h_dim: int,
+            f_scale: float = 0.1,
+            dag_seed: list = [],
+            nonlin_out: Optional[List] = None,
+            feature_types: Optional[List[int]] = None,
+            choice='1hot'
     ) -> None:
         super().__init__()
 
@@ -85,9 +141,9 @@ class Generator_causal(nn.Module):
         )
 
         if len(dag_seed) > 0:
-            M_init = torch.rand(x_dim, x_dim) * 0.0
-            M_init[torch.eye(x_dim, dtype=bool)] = 0
-            M_init = torch.rand(x_dim, x_dim) * 0.0
+            # M_init = torch.zeros(x_dim, x_dim)
+            # M_init[torch.eye(x_dim, dtype=bool)] = 0
+            M_init = torch.zeros(x_dim, x_dim)
             for pair in dag_seed:
                 M_init[pair[0], pair[1]] = 1
 
@@ -101,31 +157,48 @@ class Generator_causal(nn.Module):
             M_init = M_init.to(DEVICE)
             self.M = torch.nn.parameter.Parameter(M_init).to(DEVICE)
 
-        self.fc_i = nn.ModuleList(
-            [nn.Linear(x_dim + 1, h_dim) for i in range(self.x_dim)]
-        )
-        self.fc_f = nn.ModuleList([nn.Linear(h_dim, 1) for i in range(self.x_dim)])
+        self.choice = choice
+
+        if choice == '1hot':
+            assert h_dim % (len(feature_types) + 1) == 0
+            h_dim_per_f = h_dim // (len(feature_types) + 1)
+            self.fc_i = nn.ModuleList(
+                [EmbeddingBlock(h_dim_per_f, feature_types, self.M[:, i]) for i in range(self.x_dim)]
+            )
+        else:
+            self.fc_i = nn.ModuleList(
+                [nn.Linear(x_dim + 1, h_dim) for _ in range(self.x_dim)]
+            )
+        self.fc_f = nn.ModuleList([nn.Linear(h_dim, 1) for _ in range(self.x_dim)])
 
         for layer in self.shared.parameters():
             if type(layer) == nn.Linear:
                 torch.nn.init.xavier_normal_(layer.weight)
                 layer.weight.data *= f_scale
 
+        def _fn(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_normal_(m.weight)
+                m.weight.data *= f_scale
+
         for i, layer in enumerate(self.fc_i):
-            torch.nn.init.xavier_normal_(layer.weight)
-            layer.weight.data *= f_scale
-            layer.weight.data[:, i] = 1e-16
+            if choice == 'original':
+                torch.nn.init.xavier_normal_(layer.weight)
+                layer.weight.data *= f_scale
+                layer.weight.data[:, i] = 1e-16
+            else:
+                layer.apply(_fn)
 
         for i, layer in enumerate(self.fc_f):
             torch.nn.init.xavier_normal_(layer.weight)
             layer.weight.data *= f_scale
 
     def sequential(
-        self,
-        x: torch.Tensor,
-        z: torch.Tensor,
-        gen_order: Union[list, dict, None] = None,
-        biased_edges: dict = {},
+            self,
+            x: torch.Tensor,
+            z: torch.Tensor,
+            gen_order: Union[list, dict, None] = None,
+            biased_edges: dict = {},
     ) -> torch.Tensor:
         out = x.clone().detach()
 
@@ -133,31 +206,38 @@ class Generator_causal(nn.Module):
             gen_order = list(range(self.x_dim))
 
         for i in gen_order:
-            x_masked = out.clone() * self.M[:, i]
-            x_masked[:, i] = 0.0
-            if i in biased_edges:
-                for j in biased_edges[i]:
-                    x_j = x_masked[:, j]
-                    perm = torch.randperm(len(x_j))
-                    x_masked[:, j] = x_j[perm]
-            out_i = self.fc_i[i](torch.cat([x_masked, z[:, i].unsqueeze(1)], axis=1))
-            out_i = nn.ReLU()(out_i)
+            x = out.clone()
+            if self.choice == '1hot':
+                out_i = self.fc_i[i](x, z[:, i].unsqueeze(1),
+                                     self.M[:, i], biased_edges[i] if i in biased_edges else None)
+            else:
+                x_masked = out.clone() * self.M[:, i]
+                x_masked[:, i] = 0.0
+                # sample from distribution means...
+                # permutation
+                if i in biased_edges:
+                    for j in biased_edges[i]:
+                        x_j = x_masked[:, j]
+                        perm = torch.randperm(len(x_j))
+                        x_masked[:, j] = x_j[perm]
+                out_i = self.fc_i[i](torch.cat([x_masked, z[:, i].unsqueeze(1)], dim=1))
+                out_i = F.relu(out_i, inplace=True)
             out_i = self.shared(out_i)
-            out_i = self.fc_f[i](out_i).squeeze()
+            out_i = torch.sigmoid(self.fc_f[i](out_i)).squeeze()
             out[:, i] = out_i
 
-        if self.nonlin_out is not None:
-            split = 0
-            for act_name, step in self.nonlin_out:
-                activation = get_nonlin(act_name)
-                out[..., split : split + step] = activation(
-                    out[..., split : split + step]
-                )
-
-                split += step
-
-            if split != out.shape[-1]:
-                raise ValueError("Invalid activations")
+        # if self.nonlin_out is not None:
+        #     split = 0
+        #     for act_name, step in self.nonlin_out:
+        #         activation = get_nonlin(act_name)
+        #         out[..., split: split + step] = activation(
+        #             out[..., split: split + step]
+        #         )
+        #
+        #         split += step
+        #
+        #     if split != out.shape[-1]:
+        #         raise ValueError("Invalid activations")
 
         return out
 
@@ -184,24 +264,26 @@ class Discriminator(nn.Module):
 
 class DECAF(pl.LightningModule):
     def __init__(
-        self,
-        input_dim: int,
-        dag_seed: list = [],
-        h_dim: int = 200,
-        lr: float = 1e-3,
-        b1: float = 0.5,
-        b2: float = 0.999,
-        batch_size: int = 32,
-        lambda_gp: float = 10,
-        lambda_privacy: float = 1,
-        eps: float = 1e-8,
-        alpha: float = 1,
-        rho: float = 1,
-        weight_decay: float = 1e-2,
-        grad_dag_loss: bool = False,
-        l1_g: float = 0,
-        l1_W: float = 1,
-        nonlin_out: Optional[List] = None,
+            self,
+            input_dim: int,
+            dag_seed: list = [],
+            h_dim: int = 200,
+            lr: float = 1e-3,
+            b1: float = 0.5,
+            b2: float = 0.999,
+            batch_size: int = 32,
+            lambda_gp: float = 10,
+            lambda_privacy: float = 1,
+            eps: float = 1e-8,
+            alpha: float = 1,
+            rho: float = 1,
+            weight_decay: float = 1e-2,
+            grad_dag_loss: bool = False,
+            l1_g: float = 0,
+            l1_W: float = 1,
+            nonlin_out: Optional[List] = None,
+            feature_types: Optional[List[int]] = None,
+            choice='1hot'
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -224,6 +306,8 @@ class DECAF(pl.LightningModule):
             h_dim=h_dim,
             dag_seed=dag_seed,
             nonlin_out=nonlin_out,
+            feature_types=feature_types,
+            choice=choice
         ).to(DEVICE)
         self.discriminator = Discriminator(x_dim=self.x_dim, h_dim=h_dim).to(DEVICE)
 
@@ -257,12 +341,12 @@ class DECAF(pl.LightningModule):
             )[0]
             W[i] = torch.sum(torch.abs(gradients), axis=0)
 
-        h = trace_expm(W**2) - self.hparams.x_dim
+        h = trace_expm(W ** 2) - self.hparams.x_dim
 
         return 0.5 * self.hparams.rho * h * h + self.hparams.alpha * h
 
     def compute_gradient_penalty(
-        self, real_samples: torch.Tensor, fake_samples: torch.Tensor
+            self, real_samples: torch.Tensor, fake_samples: torch.Tensor
     ) -> torch.Tensor:
         """Calculates the gradient penalty loss for WGAN GP"""
         # Random weight term for interpolation between real and fake samples
@@ -271,7 +355,7 @@ class DECAF(pl.LightningModule):
         alpha = alpha.type_as(real_samples)
         # Get random interpolation between real and fake samples
         interpolates = (
-            alpha * real_samples + ((1 - alpha) * fake_samples)
+                alpha * real_samples + ((1 - alpha) * fake_samples)
         ).requires_grad_(True)
         d_interpolates = self.discriminator(interpolates)
         fake = torch.ones(real_samples.size(0), 1)
@@ -290,7 +374,7 @@ class DECAF(pl.LightningModule):
         return gradient_penalty
 
     def privacy_loss(
-        self, real_samples: torch.Tensor, fake_samples: torch.Tensor
+            self, real_samples: torch.Tensor, fake_samples: torch.Tensor
     ) -> torch.Tensor:
         return -torch.mean(
             torch.sqrt(
@@ -304,12 +388,12 @@ class DECAF(pl.LightningModule):
 
     def dag_loss(self) -> torch.Tensor:
         W = self.get_W()
-        h = trace_expm(W**2) - self.x_dim
+        h = trace_expm(W ** 2) - self.x_dim
         l1_loss = torch.norm(W, 1)
         return (
-            0.5 * self.hparams.rho * h**2
-            + self.hparams.alpha * h
-            + self.hparams.l1_W * l1_loss
+                0.5 * self.hparams.rho * h ** 2
+                + self.hparams.alpha * h
+                + self.hparams.l1_W * l1_loss
         )
 
     def sample_z(self, n: int) -> torch.Tensor:
@@ -346,7 +430,7 @@ class DECAF(pl.LightningModule):
         return gen_order
 
     def training_step(
-        self, batch: torch.Tensor, batch_idx: int, optimizer_idx: int
+            self, batch: torch.Tensor, batch_idx: int, optimizer_idx: int
     ) -> OrderedDict:
         # sample noise
         z = self.sample_z(batch.shape[0])
@@ -383,9 +467,9 @@ class DECAF(pl.LightningModule):
             )  # self.adversarial_loss(self.discriminator(self.generated_batch), valid)
 
             # add privacy loss of ADS-GAN
-            g_loss += self.hparams.lambda_privacy * self.privacy_loss(
-                batch, generated_batch
-            )
+            # g_loss += self.hparams.lambda_privacy * self.privacy_loss(
+            #     batch, generated_batch
+            # )
 
             # add l1 regularization loss
             g_loss += self.hparams.l1_g * self.l1_reg(self.generator)
