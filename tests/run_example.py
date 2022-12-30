@@ -10,12 +10,15 @@ import torch
 from utils import gen_data_nonlinear, load_adult, load_adult_ex
 from sklearn.model_selection import train_test_split
 
-from decaf import DECAF
+from decaf.DECAF import DECAF
 from decaf.data import DataModule
+
+import sys
+sys.path.append(r'E:\PycharmProjs\DECAF')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--h_dim", type=int, default=240)
+    parser.add_argument("--h_dim", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.5e-3)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
@@ -25,8 +28,11 @@ if __name__ == "__main__":
     parser.add_argument("--l1_W", type=float, default=1e-4)
     parser.add_argument("--logfile", type=str, default="default_log.txt")
     parser.add_argument("--name", type=str, default="decaf")
-    parser.add_argument("--embed", type=str, default="original")
+    parser.add_argument("--embed", type=str, choices=['1hot', 'gaussian', 'original'], default="original")
+    parser.add_argument("--debias", type=str, choices=['nd', 'ftu', 'cf', 'dp', 'dp2'], default="nd")
+    parser.add_argument("--continue_training", '-c', action="store_true")
     parser.add_argument("--datasize", type=int, default=1000)
+    parser.add_argument("--syn_size", type=int, default=-1)
     args = parser.parse_args()
 
     # causal structure is in dag_seed
@@ -42,7 +48,14 @@ if __name__ == "__main__":
                 [9, 3], [9, 8], [9, 2], [9, 1], [9, 10], [9, 5]]
 
     # edge removal dictionary
-    bias_dict = {10: [7]}  # This removes the edge into 6 from 3.
+    # bias_dict = {10: [7]}  # This removes the edge into 6 from 3.
+    bias_dict = {
+        'nd': {},
+        'ftu': {10: [7]},
+        'cf': {10: [3, 5, 7]},
+        'dp': {10: [1, 2, 3, 4, 5, 7, 8]},
+        'dp2': {1: [7], 2: [7], 3: [7], 4: [7], 5: [7], 8: [7], 10: [7]}
+    }[args.debias]
 
     # DATA SETUP according to dag_seed
     G = nx.DiGraph(dag_seed)
@@ -95,18 +108,39 @@ if __name__ == "__main__":
         trainer.fit(model, dm)
         torch.save(model, f'{args.name}.pth')
     else:
-       model = torch.load(f'{args.name}.pth')
-    synth_dataset = (
-        model.gen_synthetic(data_tensor, biased_edges={}).detach().cpu().numpy()
-    )
-    synth_dataset[:, -1] = synth_dataset[:, -1].astype(np.int8)
-
-    synth_dataset = pd.DataFrame(synth_dataset,
-                                 index=data_train.index,
-                                 columns=data_train.columns)
-    synth_dataset['sex'] = np.round(synth_dataset['sex'])
-    synth_dataset['label'] = np.round(synth_dataset['label'])
+        # model = torch.load(f'{args.name}.pth')
+        model.load_state_dict(torch.load(f'{args.name}.pth').state_dict())
+        if args.continue_training:
+            print('continue training ...')
+            trainer.fit(model, dm)
+            torch.save(model, f'{args.name}.pth')
 
     from eval_utils import eval_model
-    print(eval_model(synth_dataset, data_test))
+    results_lst = []
+    for _ in range(10):
+        if args.syn_size == -1:
+            synth_dataset = (
+                model.gen_synthetic(data_tensor, biased_edges=bias_dict).detach().cpu().numpy()
+            )
+        else:
+            synth_dataset = (
+                np.vstack([model.gen_synthetic(data_tensor[start * args.syn_size: (start + 1) * args.syn_size],
+                                               biased_edges=bias_dict).detach().cpu().numpy()
+                           for start in range(int(np.ceil(data_tensor.size(0) / args.syn_size)))])
+            )
+        synth_dataset[:, -1] = synth_dataset[:, -1].astype(np.int8)
+
+        synth_dataset = pd.DataFrame(synth_dataset,
+                                     index=data_train.index,
+                                     columns=data_train.columns)
+        synth_dataset['sex'] = np.round(synth_dataset['sex'])
+        synth_dataset['label'] = np.round(synth_dataset['label'])
+        a = synth_dataset['label'].sum() / synth_dataset['label'].size
+        results_lst += [eval_model(synth_dataset, data_test)]
+        print(results_lst[-1])
+    print("AVG result")
+    avg_res = dict(zip(results_lst[0].keys(), [0.] * len(results_lst[0])))
+    for key in results_lst[0]:
+        avg_res[key] = sum([res[key] for res in results_lst]) / len(results_lst)
+    print(avg_res)
     print("Data generated successfully!")

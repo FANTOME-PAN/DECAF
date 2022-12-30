@@ -18,7 +18,7 @@ columns_adult = [
     # "capital-loss",
     "hours-per-week",
     "native-country",
-    "income",
+    "label",
 ]
 
 columns_credit = [
